@@ -1,0 +1,25 @@
+[build-system]
+requires = ["setuptools>=68", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "pagestorm"
+version = "0.1.0"
+description = "Standalone vLLM interface for the Pagestorm story models"
+readme = "README.md"
+requires-python = ">=3.11"
+dependencies = [
+  "huggingface_hub>=1.21.0",
+  "transformers>=5.12.1",
+  "jinja2>=3.1,<4",
+  "vllm>=0.23.0",
+]
+
+[project.scripts]
+pagestorm = "pagestorm.cli:main"
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+
+[tool.setuptools.packages.find]
+include = ["pagestorm*"]
