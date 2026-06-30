@@ -46,6 +46,10 @@ app = Flask(__name__)
 JOBS: "dict[str, object]" = {}
 
 
+def _configured_server_url() -> str:
+    return (request.args.get("server") or DEFAULT_LLAMA_URL).rstrip("/")
+
+
 def _slug(text: str) -> str:
     s = re.sub(r"[^a-z0-9]+", "-", text.lower()).strip("-")
     return s[:48] or "book"
@@ -60,7 +64,7 @@ def index():
 def health():
     import requests as _rq
 
-    url = (request.args.get("server") or DEFAULT_LLAMA_URL).rstrip("/")
+    url = _configured_server_url()
     try:
         ok = _rq.get(f"{url}/health", timeout=4).json().get("status") == "ok"
     except Exception:
@@ -73,7 +77,7 @@ def server_info():
     """Autodetect what the llama-server is serving: context size + model name."""
     import requests as _rq
 
-    url = (request.args.get("server") or DEFAULT_LLAMA_URL).rstrip("/")
+    url = _configured_server_url()
     info = {"server": url, "ready": False, "n_ctx": None, "model": None}
     try:
         props = _rq.get(f"{url}/props", timeout=4).json()
@@ -86,6 +90,70 @@ def server_info():
     except Exception:
         pass
     return jsonify(info)
+
+
+@app.route("/api/models")
+def models():
+    """List available model IDs from llama-server or an OpenAI-compatible router."""
+    import requests as _rq
+
+    url = _configured_server_url()
+    result = {"server": url, "ready": False, "models": [], "source": None}
+
+    def add_model(items: list[str], value, *, path_name: bool = False) -> None:
+        if isinstance(value, str):
+            name = os.path.basename(value.strip()) if path_name else value.strip()
+            if name and name not in items:
+                items.append(name)
+
+    try:
+        response = _rq.get(f"{url}/v1/models", timeout=6)
+        if response.ok:
+            data = response.json()
+            models: list[str] = []
+            for item in data.get("data", []):
+                if isinstance(item, dict):
+                    add_model(models, item.get("id") or item.get("name") or item.get("model"))
+                else:
+                    add_model(models, item)
+            if models:
+                result.update({"ready": True, "models": models, "source": "/v1/models"})
+                return jsonify(result)
+    except Exception:
+        pass
+
+    try:
+        response = _rq.get(f"{url}/models", timeout=6)
+        if response.ok:
+            data = response.json()
+            raw_models = data.get("models") if isinstance(data, dict) else data
+            models = []
+            if isinstance(raw_models, list):
+                for item in raw_models:
+                    if isinstance(item, dict):
+                        add_model(models, item.get("id") or item.get("name") or item.get("model"))
+                    else:
+                        add_model(models, item)
+            if models:
+                result.update({"ready": True, "models": models, "source": "/models"})
+                return jsonify(result)
+    except Exception:
+        pass
+
+    try:
+        props = _rq.get(f"{url}/props", timeout=6).json()
+        models = []
+        gen = props.get("default_generation_settings") or {}
+        model_path = props.get("model_path")
+        if model_path:
+            add_model(models, model_path, path_name=True)
+        else:
+            add_model(models, props.get("model") or gen.get("model"))
+        if models:
+            result.update({"ready": True, "models": models, "source": "/props"})
+    except Exception:
+        pass
+    return jsonify(result)
 
 
 @app.route("/api/stop")

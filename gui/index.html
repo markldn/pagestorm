@@ -232,7 +232,8 @@
     </div>
 
     <div class="set"><label class="lbl">Model name (optional · for routers / llama-swap)</label>
-      <input class="txt" id="setModel" placeholder="auto-detected from server" />
+      <input class="txt" id="setModel" list="modelOptions" placeholder="auto-detected from server" />
+      <datalist id="modelOptions"></datalist>
       <span id="setModelInfo" style="font-size:11.5px;color:var(--muted)"></span>
     </div>
 
@@ -324,14 +325,18 @@ for(const [id,key] of Object.entries(TEXTSET)){
   $('#'+id).addEventListener('change',()=>{CFG[key]=$('#'+id).value.trim();saveCfg();});
 }
 $('#gearBtn').onclick=()=>$('#scrim').classList.add('show');
+$('#gearBtn').addEventListener('click',()=>fetchModels());
 $('#closeSet').onclick=()=>$('#scrim').classList.remove('show');
 $('#scrim').onclick=e=>{if(e.target===$('#scrim'))$('#scrim').classList.remove('show');};
-$('#resetSet').onclick=()=>{Object.assign(CFG,DEFAULTS);saveCfg();applyCfg();toast('Settings restored to defaults');detectServer();};
-$('#setServer').addEventListener('change',()=>{CFG.server=$('#setServer').value.trim();saveCfg();health();detectServer();});
+$('#resetSet').onclick=()=>{Object.assign(CFG,DEFAULTS);saveCfg();applyCfg();toast('Settings restored to defaults');detectServer();fetchModels();};
+$('#setServer').addEventListener('change',()=>{CFG.server=$('#setServer').value.trim();saveCfg();health();detectServer();fetchModels();});
 $('#testServer').onclick=async()=>{
   const v=$('#setServer').value.trim();const s=$('#setServerStatus');s.textContent='testing…';
+  CFG.server=v;saveCfg();
   try{const r=await fetch('/api/health'+(v?('?server='+encodeURIComponent(v)):''));const j=await r.json();
     s.textContent=j.ready?('✓ reachable · '+j.server):('✗ not reachable · '+j.server);s.style.color=j.ready?'var(--ok)':'var(--bad)';
+    detectServer();
+    fetchModels();
   }catch{s.textContent='✗ error';s.style.color='var(--bad)';}
 };
 applyCfg();
@@ -351,6 +356,33 @@ async function detectServer(){
   }catch{}
 }
 detectServer();
+
+async function fetchModels(){
+  const v=CFG.server;
+  const info=$('#setModelInfo');
+  const opts=$('#modelOptions');
+  info.textContent='fetching models…';info.style.color='var(--muted)';
+  try{
+    const r=await fetch('/api/models'+(v?('?server='+encodeURIComponent(v)):''));
+    const j=await r.json();
+    opts.innerHTML='';
+    (j.models||[]).forEach(m=>{const o=document.createElement('option');o.value=m;opts.appendChild(o);});
+    if(j.models&&j.models.length){
+      $('#setModel').placeholder=j.models[0];
+      if(!CFG.model&&j.models.length===1){CFG.model=j.models[0];$('#setModel').value=CFG.model;saveCfg();}
+      info.textContent=(j.models.length===1?'model: ':'models: ')+j.models.join(', ');
+      info.style.color='var(--muted)';
+    }else{
+      info.textContent=j.ready?'no models reported by server':'server not reachable';
+      info.style.color=j.ready?'var(--muted)':'var(--bad)';
+    }
+  }catch{
+    opts.innerHTML='';
+    info.textContent='could not fetch models';
+    info.style.color='var(--bad)';
+  }
+}
+fetchModels();
 
 EXAMPLES.forEach(x=>{const c=el('div','chip');c.textContent=x;c.onclick=()=>$('#prompt').value=x;$('#chips').appendChild(c);});
 
