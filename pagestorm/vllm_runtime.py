@@ -1,23 +1,74 @@
+"""llama.cpp-server backed drop-in replacement for pagestorm's vLLM runtime.
+
+This module keeps the exact public surface the orchestrators rely on
+(`StoryVllmRuntime`, `create_generation_runtime`, `generate_completion`,
+`close_generation_runtime`) but routes generation to a running
+`llama-server` (`/completion`) instead of an in-process vLLM engine.
+
+Why: the model is a `ministral3` arch that runs cleanly as a GGUF under the
+ROCm llama.cpp build, avoiding a vLLM-on-ROCm install. The model was trained
+to emit the staged formats, so generation is best-effort (no regex-guided
+decoding); `structured_outputs` regexes are passed through to the server only
+if it advertises support, otherwise ignored. Strict regex enforcement still
+happens in the orchestrator's own validation pass.
+
+Connection: set `PAGESTORM_LLAMA_URL`, or set `PAGESTORM_LLAMA_HOST` /
+`PAGESTORM_LLAMA_PORT` and let the URL be assembled at runtime.
+"""
+
 from __future__ import annotations
 
-import asyncio
-from dataclasses import dataclass
-from importlib import import_module
-from pathlib import Path
+import json
+import os
 import threading
+from dataclasses import dataclass
+from pathlib import Path
 from typing import Any
-from uuid import uuid4
+
+import requests
 
 from .models import StoryBundle
+from .regex_to_gbnf import regex_to_gbnf
+
+
+DEFAULT_LLAMA_HOST = os.environ.get("PAGESTORM_LLAMA_HOST", "localhost")
+DEFAULT_LLAMA_PORT = os.environ.get("PAGESTORM_LLAMA_PORT", "8091")
+DEFAULT_SERVER_URL = os.environ.get("PAGESTORM_LLAMA_URL", f"http://{DEFAULT_LLAMA_HOST}:{DEFAULT_LLAMA_PORT}")
+REQUEST_TIMEOUT_SECONDS = float(os.environ.get("PAGESTORM_LLAMA_TIMEOUT", "1800"))
+
+
+class GenerationCancelled(Exception):
+    """Raised inside generate_completion when the caller requests a stop."""
+
+
+# Per-thread cancel flags. A generation runs in one worker thread; the caller
+# registers a threading.Event for that thread and sets it to abort mid-stream.
+_CANCEL: dict[int, threading.Event] = {}
+
+
+def register_cancel(event: threading.Event) -> None:
+    _CANCEL[threading.get_ident()] = event
+
+
+def unregister_cancel() -> None:
+    _CANCEL.pop(threading.get_ident(), None)
+
+
+def _env_float(name: str):
+    v = os.environ.get(name, "").strip()
+    return float(v) if v else None
+
+
+def _env_int(name: str):
+    v = os.environ.get(name, "").strip()
+    return int(v) if v else None
 
 
 @dataclass(frozen=True)
 class StoryVllmRuntime:
-    llm: Any
+    server_url: str
     max_model_len: int
     model_identifier: str
-    event_loop: Any | None = None
-    event_loop_thread: Any | None = None
 
 
 def _has_local_model_weights(bundle_path: Path) -> bool:
@@ -25,96 +76,25 @@ def _has_local_model_weights(bundle_path: Path) -> bool:
         return True
     if (bundle_path / "model.safetensors.index.json").exists():
         return True
-    return any(bundle_path.glob("*.safetensors"))
+    return any(bundle_path.glob("*.safetensors")) or any(bundle_path.glob("*.gguf"))
 
 
 def _resolve_runtime_model_identifier(bundle: StoryBundle) -> str:
     if bundle.source_repo_id is not None:
         return bundle.source_repo_id
-    if not _has_local_model_weights(bundle.bundle_path):
-        raise FileNotFoundError(
-            f"Local bundle path {bundle.bundle_path} does not contain model weights. "
-            "Use --repo-id or a full local bundle export."
-        )
+    # The GGUF may live outside the bundle dir; identifier is informational only.
     return str(bundle.bundle_path)
 
 
-def _load_async_engine_runtime_types() -> tuple[Any, Any]:
+def _wait_for_server(server_url: str) -> None:
     try:
-        vllm_module = import_module("vllm")
-    except ImportError as exc:
-        raise RuntimeError("pagestorm requires the vllm Python package for generation.") from exc
-    async_engine_class = getattr(vllm_module, "AsyncLLMEngine", None)
-    if async_engine_class is None:
-        try:
-            async_engine_module = import_module("vllm.engine.async_llm_engine")
-        except ImportError:
-            async_engine_module = None
-        if async_engine_module is not None:
-            async_engine_class = getattr(async_engine_module, "AsyncLLMEngine", None)
-    if async_engine_class is None:
-        try:
-            async_engine_module = import_module("vllm.v1.engine.async_llm")
-        except ImportError:
-            async_engine_module = None
-        if async_engine_module is not None:
-            async_engine_class = getattr(async_engine_module, "AsyncLLM", None)
-    if async_engine_class is None:
-        raise RuntimeError("pagestorm requires a vLLM async engine implementation for in-process streaming generation.")
-
-    async_engine_args_class = getattr(vllm_module, "AsyncEngineArgs", None)
-    if async_engine_args_class is None:
-        try:
-            async_engine_args_module = import_module("vllm.engine.arg_utils")
-        except ImportError as exc:
-            raise RuntimeError("pagestorm requires vllm.engine.arg_utils.AsyncEngineArgs for generation.") from exc
-        async_engine_args_class = getattr(async_engine_args_module, "AsyncEngineArgs", None)
-    if async_engine_args_class is None:
-        raise RuntimeError("pagestorm requires vLLM AsyncEngineArgs for in-process generation.")
-    return async_engine_class, async_engine_args_class
-
-
-def _load_sampling_params_types() -> tuple[Any, Any]:
-    try:
-        sampling_params_module = import_module("vllm.sampling_params")
-    except ImportError as exc:
-        raise RuntimeError("pagestorm requires vllm.sampling_params for generation.") from exc
-    return getattr(sampling_params_module, "SamplingParams"), getattr(sampling_params_module, "StructuredOutputsParams")
-
-
-def _run_in_event_loop(event_loop: asyncio.AbstractEventLoop, coroutine: Any) -> Any:
-    return asyncio.run_coroutine_threadsafe(coroutine, event_loop).result()
-
-
-def _run_event_loop_forever(event_loop: asyncio.AbstractEventLoop, loop_started: threading.Event) -> None:
-    asyncio.set_event_loop(event_loop)
-    loop_started.set()
-    event_loop.run_forever()
-
-
-async def _drain_pending_event_loop_tasks() -> None:
-    current_task = asyncio.current_task()
-    pending_tasks = [task for task in asyncio.all_tasks() if task is not current_task and not task.done()]
-    for pending_task in pending_tasks:
-        pending_task.cancel()
-    if pending_tasks:
-        await asyncio.gather(*pending_tasks, return_exceptions=True)
-
-
-async def _call_sync_function(function: Any) -> None:
-    function()
-
-
-def _shutdown_event_loop_thread(
-    event_loop: asyncio.AbstractEventLoop,
-    event_loop_thread: threading.Thread | None,
-) -> None:
-    if not event_loop.is_closed():
-        event_loop.call_soon_threadsafe(event_loop.stop)
-    if event_loop_thread is not None and event_loop_thread.is_alive():
-        event_loop_thread.join()
-    if not event_loop.is_closed():
-        event_loop.close()
+        response = requests.get(f"{server_url}/health", timeout=10)
+        response.raise_for_status()
+    except requests.RequestException as exc:
+        raise RuntimeError(
+            f"llama-server is not reachable at {server_url}. Start it first "
+            f"(see serve.sh). Underlying error: {exc}"
+        ) from exc
 
 
 def create_generation_runtime(
@@ -124,85 +104,18 @@ def create_generation_runtime(
     gpu_memory_utilization: float,
     max_model_len: int | None,
 ) -> StoryVllmRuntime:
-    async_engine_class, async_engine_args_class = _load_async_engine_runtime_types()
-    model_identifier = _resolve_runtime_model_identifier(bundle)
-    runtime_kwargs: dict[str, Any] = {
-        "model": model_identifier,
-        "tokenizer": str(bundle.bundle_path),
-        "tensor_parallel_size": tensor_parallel_size,
-        "gpu_memory_utilization": gpu_memory_utilization,
-        "max_model_len": max_model_len or bundle.profile.default_max_model_len,
-        "dtype": "float16",
-        "structured_outputs_config": {"backend": "guidance"},
-    }
-    if bundle.profile.tokenizer_mode is not None:
-        runtime_kwargs["tokenizer_mode"] = bundle.profile.tokenizer_mode
-    event_loop = asyncio.new_event_loop()
-    loop_started = threading.Event()
-    event_loop_thread = threading.Thread(
-        target=_run_event_loop_forever,
-        args=(event_loop, loop_started),
-        name="pagestorm-vllm-loop",
-        daemon=True,
-    )
-    event_loop_thread.start()
-    loop_started.wait()
-    try:
-        async_engine_args = async_engine_args_class(**runtime_kwargs)
-        llm = _run_in_event_loop(
-            event_loop,
-            _create_async_runtime_engine(async_engine_class, async_engine_args),
-        )
-    except Exception:
-        _shutdown_event_loop_thread(event_loop, event_loop_thread)
-        raise
+    # tensor_parallel_size / gpu_memory_utilization are vLLM concepts and are
+    # intentionally ignored here; the llama-server process owns GPU placement.
+    del tensor_parallel_size, gpu_memory_utilization
+    # Read at call time so a caller (e.g. the GUI) can override per run.
+    server_url = os.environ.get("PAGESTORM_LLAMA_URL", DEFAULT_SERVER_URL).rstrip("/")
+    _wait_for_server(server_url)
+    resolved_max_model_len = max_model_len or bundle.profile.default_max_model_len
     return StoryVllmRuntime(
-        llm=llm,
-        max_model_len=int(runtime_kwargs["max_model_len"]),
-        model_identifier=model_identifier,
-        event_loop=event_loop,
-        event_loop_thread=event_loop_thread,
+        server_url=server_url,
+        max_model_len=int(resolved_max_model_len),
+        model_identifier=_resolve_runtime_model_identifier(bundle),
     )
-
-
-async def _create_async_runtime_engine(async_engine_class: Any, async_engine_args: Any) -> Any:
-    return async_engine_class.from_engine_args(async_engine_args)
-
-
-def close_generation_runtime(runtime: StoryVllmRuntime) -> None:
-    if runtime.event_loop is None:
-        return
-    if runtime.event_loop.is_closed():
-        return
-    shutdown_background_loop = getattr(runtime.llm, "shutdown_background_loop", None)
-    if callable(shutdown_background_loop):
-        _run_in_event_loop(runtime.event_loop, _call_sync_function(shutdown_background_loop))
-    _run_in_event_loop(runtime.event_loop, _drain_pending_event_loop_tasks())
-    _shutdown_event_loop_thread(runtime.event_loop, runtime.event_loop_thread)
-
-
-async def _stream_completion_text(
-    runtime: StoryVllmRuntime,
-    *,
-    prompt: str,
-    sampling_params: Any,
-    text_chunk_callback: Any | None,
-) -> str:
-    streamed_text = ""
-    async for request_output in runtime.llm.generate(prompt, sampling_params, request_id=uuid4().hex):
-        completion_outputs = getattr(request_output, "outputs", None)
-        if not isinstance(completion_outputs, list) or not completion_outputs:
-            raise ValueError("vLLM generation output did not include any completion choices.")
-        completion_text = getattr(completion_outputs[0], "text", None)
-        if not isinstance(completion_text, str):
-            raise TypeError("vLLM completion output did not contain text.")
-        if not completion_text.startswith(streamed_text):
-            raise ValueError("vLLM streaming output stopped being a monotonic text extension.")
-        text_delta = completion_text[len(streamed_text) :]
-        if text_delta and text_chunk_callback is not None:
-            text_chunk_callback(text_delta)
-        streamed_text = completion_text
-    return streamed_text
 
 
 def generate_completion(
@@ -217,27 +130,87 @@ def generate_completion(
     seed: int | None = None,
     text_chunk_callback: Any | None = None,
 ) -> str:
-    if runtime.event_loop is None:
-        raise ValueError("StoryVllmRuntime.event_loop must be populated for pagestorm generation.")
-    SamplingParams, StructuredOutputsParams = _load_sampling_params_types()
-    sampling_params_kwargs: dict[str, Any] = {
-        "max_tokens": max_tokens,
-        "temperature": temperature,
-        "stop": stop,
+    # Optional global sampling overrides (set by the GUI). Blank/unset => use the
+    # orchestrator's per-stage values (the tuned defaults).
+    temp_override = _env_float("PAGESTORM_TEMPERATURE")
+    topk_override = _env_int("PAGESTORM_TOP_K")
+    payload: dict[str, Any] = {
+        "prompt": prompt,
+        "n_predict": int(max_tokens),
+        "temperature": temp_override if temp_override is not None else float(temperature),
+        "stop": list(stop),
+        "stream": True,
+        "cache_prompt": True,
     }
+    effective_top_k = topk_override if topk_override is not None else top_k
+    if effective_top_k is not None:
+        payload["top_k"] = int(effective_top_k)
     if seed is not None:
-        sampling_params_kwargs["seed"] = seed
-    if top_k is not None:
-        sampling_params_kwargs["top_k"] = top_k
-    if structured_outputs is not None:
-        sampling_params_kwargs["structured_outputs"] = StructuredOutputsParams(**structured_outputs)
-    sampling_params = SamplingParams(**sampling_params_kwargs)
-    return _run_in_event_loop(
-        runtime.event_loop,
-        _stream_completion_text(
-            runtime,
-            prompt=prompt,
-            sampling_params=sampling_params,
-            text_chunk_callback=text_chunk_callback,
-        ),
-    )
+        payload["seed"] = int(seed)
+    top_p = _env_float("PAGESTORM_TOP_P")
+    if top_p is not None:
+        payload["top_p"] = top_p
+    min_p = _env_float("PAGESTORM_MIN_P")
+    if min_p is not None:
+        payload["min_p"] = min_p
+    rep = _env_float("PAGESTORM_REPEAT_PENALTY")
+    if rep is not None:
+        payload["repeat_penalty"] = rep
+    model_name = os.environ.get("PAGESTORM_MODEL", "").strip()
+    if model_name:
+        payload["model"] = model_name  # used by routers/llama-swap; ignored by plain llama.cpp
+    # Structured outputs: vLLM constrained decoding to a per-stage regex.
+    # llama.cpp's /completion takes a GBNF `grammar`, so we compile the regex to
+    # GBNF and send that. Enabled by default; set PAGESTORM_GRAMMAR=0 to disable
+    # (falls back to best-effort, relying on the orchestrator's validation pass).
+    # Any conversion failure also falls back rather than aborting the run.
+    if (
+        structured_outputs is not None
+        and structured_outputs.get("regex")
+        and os.environ.get("PAGESTORM_GRAMMAR", "1") != "0"
+    ):
+        try:
+            payload["grammar"] = regex_to_gbnf(structured_outputs["regex"])
+        except Exception as exc:  # noqa: BLE001 - never let grammar break a run
+            print(f"[pagestorm] regex->GBNF failed, generating unconstrained: {exc}", flush=True)
+
+    cancel = _CANCEL.get(threading.get_ident())
+    streamed_text = ""
+    with requests.post(
+        f"{runtime.server_url}/completion",
+        json=payload,
+        stream=True,
+        timeout=REQUEST_TIMEOUT_SECONDS,
+    ) as response:
+        response.raise_for_status()
+        # Iterate raw bytes and parse as UTF-8 ourselves. `decode_unicode=True`
+        # would use the response's apparent encoding, which defaults to latin-1
+        # for SSE (no charset header) and double-encodes non-ASCII text.
+        for raw_line in response.iter_lines():
+            if cancel is not None and cancel.is_set():
+                # Closing the streamed response stops llama.cpp generation.
+                raise GenerationCancelled("generation stopped by user")
+            if not raw_line:
+                continue
+            if raw_line.startswith(b"data:"):
+                raw_line = raw_line[len(b"data:"):].strip()
+            if not raw_line:
+                continue
+            try:
+                event = json.loads(raw_line)  # json.loads decodes bytes as UTF-8
+            except json.JSONDecodeError:
+                continue
+            content_piece = event.get("content")
+            if isinstance(content_piece, str) and content_piece:
+                if text_chunk_callback is not None:
+                    text_chunk_callback(content_piece)
+                streamed_text += content_piece
+            if event.get("stop") is True:
+                break
+    return streamed_text
+
+
+def close_generation_runtime(runtime: StoryVllmRuntime) -> None:
+    # The llama-server lifecycle is managed externally (serve.sh); nothing to
+    # tear down per-run.
+    del runtime
